@@ -11,30 +11,48 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 # app.R
 
 # ---------- Library Imports ----------
-library(shiny)
-library(RODBC)
-library(dplyr)
-library(lubridate)
-library(plotly)
-library(bslib)
-library(jsonlite)
-library(DT)
-library(zoo)
-library(viridis)
-library(ggplot2)
+
+if (!require("pacman")) {
+  install.packages("pacman")
+}
+pacman::p_load(shiny, dplyr, lubridate, plotly, bslib, jsonlite, DT, zoo, viridis, ggplot2, odbc, DBI)
 
 
+# ---------- Database Connection ----------
+db_params <- list(
+    driver = "SQL Server",
+    server = "HITCHIE2022\\PROD1",
+    database = "AutoCaller",
+    trusted_connection = "Yes"
+)
+
+# Function to create database connection
+create_db_connection <- function() {
+    tryCatch({
+        dbConnect(odbc(),
+                 Driver = db_params$driver,
+                 Server = db_params$server,
+                 Database = db_params$database,
+                 Trusted_Connection = db_params$trusted_connection)
+    }, error = function(e) {
+        message("Error connecting to database: ", e$message)
+        NULL
+    })
+}
 
 # ---------- Source Files ----------
+
 # Core files
-source("global_functions.R")
 source("global_resources.R")
+source("global_functions.R")
+source("ui_definition.R")
+
 
 addResourcePath("www", "www")
-source("ui_definition.R")
 
 # Module function files
 source("r/db_module/db_functions.R")
@@ -65,70 +83,61 @@ source("r/power_module/power_output.R")
 
 # ---------- Server Function Definition ----------
 server <- function(input, output, session) {
-  # Initialize reactive values
-  wx_data <- reactiveVal(NULL)
-  WX_stations <- reactiveVal(NULL)
-  active_crmp_sensors <- reactiveVal(NULL)
-  available_stations <- reactiveVal(NULL)
-  
-  # Initialize caches 
-  cached_power_data <- reactiveVal(NULL)
-  cached_temp_extremes <- reactiveVal(NULL)
-  cached_missing_entries <- reactiveVal(NULL)
-  cached_rn1_outliers <- reactiveVal(NULL)
-  cached_constant_temp <- reactiveVal(NULL)
-  cached_zero_wspd <- reactiveVal(NULL)
-  cached_precip_changes <- reactiveVal(NULL)
-  cached_consecutive_rh <- reactiveVal(NULL)
-  cached_temp_trends <- reactiveVal(NULL)
-  cached_vbat_trends <- reactiveVal(NULL)
-  
-#Update fetch based on time selection
-observe({
-    req(input$time_preset)
-    if (input$time_preset != "custom") {
-        # Convert the preset value to numeric and update num_entries
-        updateNumericInput(session, "num_entries",
-                          value = as.numeric(input$time_preset))
-    }
-})
-  # Update available stations when fire centre changes
- observe({
-    req(input$fire_centre)
+    # Initialize reactive values
+    wx_data <- reactiveVal(NULL)
+    WX_stations <- reactiveVal(NULL)
+    active_crmp_sensors <- reactiveVal(NULL)
+    available_stations <- reactiveVal(NULL)
     
-    # Get stations for the selected fire centre
-    zones <- fire_center_mapping[[input$fire_centre]]
-    available_stations <- unique(unlist(sapply(zones, function(zone) {
-        fire_zone_mapping[[zone]]
-    })))
-    
-    if (input$station_selection_type == "specific") {
-        # Update station selection choices only when in specific selection mode
-        updateSelectizeInput(session, "selected_stations",
-                           choices = sort(available_stations))
-    }
-})
+    # Initialize caches 
+    cached_power_data <- reactiveVal(NULL)
+    cached_temp_extremes <- reactiveVal(NULL)
+    cached_missing_entries <- reactiveVal(NULL)
+    cached_rn1_outliers <- reactiveVal(NULL)
+    cached_constant_temp <- reactiveVal(NULL)
+    cached_zero_wspd <- reactiveVal(NULL)
+    cached_precip_changes <- reactiveVal(NULL)
+    cached_consecutive_rh <- reactiveVal(NULL)
+    cached_temp_trends <- reactiveVal(NULL)
+    cached_vbat_trends <- reactiveVal(NULL)
 
-# Modify the data fetching section
-observeEvent(input$fetch_data, {
-    req(input$fire_centre)
-    
-    withProgress(message = "Fetching data...", {
-        conn <- odbcConnect("FireWx Database")
-        on.exit(odbcClose(conn), add = TRUE)
+	 # Add reactive expression for effective number of entries
+  effective_num_entries <- reactive({
+    if (input$time_preset == "custom") {
+      return(input$num_entries)
+    } else {
+      return(as.numeric(input$time_preset))
+    }
+  })
+
+    # Modify the data fetching section
+    observeEvent(input$fetch_data, {
+        req(input$fire_centre)
         
-        if (is.null(conn)) {
-            output$missing_entries_output <- renderPrint("Connection failed")
-            return()
-        }
-        
-        selected_fire_centre <- input$fire_centre
-        
-        # Get tables for the selected fire centre
-        zones <- fire_center_mapping[[selected_fire_centre]]
-        available_stations <- unique(unlist(sapply(zones, function(zone) {
-            fire_zone_mapping[[zone]]
-        })))
+        withProgress(message = "Fetching data...", {
+            # Create database connection
+            conn <- create_db_connection()
+            
+            if (is.null(conn)) {
+                output$missing_entries_output <- renderPrint("Database connection failed")
+                return()
+            }
+            
+            # Ensure connection is closed when done
+            on.exit({
+                if (!is.null(conn)) {
+                    dbDisconnect(conn)
+                }
+            })
+            
+            selected_fire_centre <- input$fire_centre
+            
+            # Get tables for the selected fire centre
+            zones <- fire_center_mapping[[selected_fire_centre]]
+            available_stations <- unique(unlist(sapply(zones, function(zone) {
+                fire_zone_mapping[[zone]]
+            })))
+
         
         # Create mapping between display names and table names
         station_to_table <- setNames(
@@ -149,10 +158,11 @@ observeEvent(input$fetch_data, {
     station_to_table[available_stations]
 }
         
-        # Fetch weather station data
+       # Fetch weather station data
         stations_data <- lapply(tables_to_fetch, function(table) {
             if (input$fetch_type == "last_n") {
-                fetch_data_from_db(conn, table, num_entries = input$num_entries, 
+                # Use the reactive expression to get the effective number of entries
+                fetch_data_from_db(conn, table, num_entries = effective_num_entries(), 
                                  fire_centre = selected_fire_centre)
             } else if (input$fetch_type == "by_date") {
                 fetch_data_from_db(conn, table, selected_date = input$select_date, 
@@ -345,6 +355,28 @@ observeEvent(input$fetch_data, {
     })
   })
   
+
+observe({
+  req(input$fire_centre)
+  
+  # Get zones for selected fire centre
+  zones <- fire_center_mapping[[input$fire_centre]]
+  
+  # Get available stations for these zones
+  available_stations <- unique(unlist(sapply(zones, function(zone) {
+    fire_zone_mapping[[zone]]
+  })))
+  
+  # Update the selectizeInput choices
+  updateSelectizeInput(session, "selected_stations",
+    choices = available_stations,
+    selected = NULL,
+    options = list(
+      placeholder = 'Select stations to include',
+      plugins = list('remove_button')
+    )
+  )
+})
   # ---------- Last Entry Time Check ----------
   last_entry_time_check <- eventReactive(input$fetch_data, {
     req(WX_stations())
@@ -451,6 +483,7 @@ observeEvent(input$fetch_data, {
 
   # ---------- Output Renderings ----------
   
+# Data status indicator renderer
 output$data_status <- renderText({
   req(input$fetch_data)
   
@@ -659,10 +692,10 @@ output$erratic_temp_output <- renderPrint({
   })
   
   
-output$station_rainfall_output <- renderPrint({
+  output$station_rainfall_output <- renderPrint({
   req(wx_data())  # Ensure wx_data is available
   render_station_rainfall_output(wx_data(), input$station_select)
-})
+  })
 
 
   output$rn1_outliers_output <- renderPrint({
@@ -673,6 +706,8 @@ output$station_rainfall_output <- renderPrint({
     create_rn1_outliers_plot(wx_data(), all_rn1_outliers(), input$rn1_outliers_station_select)
   })
 }
+
+
 
 # ---------- Run Application ----------
 shinyApp(ui = ui, server = server)
